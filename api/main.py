@@ -1,8 +1,12 @@
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from sklearn.exceptions import NotFittedError
 
-from api.schemas import EncounterInput, PredictionResponse
+from api.schemas import (
+    EncounterInput,
+    PredictionResponse,
+    BatchPredictionRequest,
+    BatchPredictionResponse,
+)
 from api.model_loader import load_model_and_metadata
 
 app = FastAPI(
@@ -23,14 +27,12 @@ def health_check():
 def predict(encounter: EncounterInput):
     model, metadata = load_model_and_metadata()
 
-    # Build a single-row DataFrame with columns in the exact order the pipeline expects
     input_dict = encounter.model_dump(by_alias=True)
     row = pd.DataFrame([input_dict])[metadata["expected_features"]]
 
     try:
         probability = float(model.predict_proba(row)[:, 1][0])
     except ValueError as e:
-        # Most likely cause: an unrecognized category value not seen during training
         raise HTTPException(
             status_code=422,
             detail=f"Could not score this encounter — likely an unrecognized "
@@ -45,3 +47,31 @@ def predict(encounter: EncounterInput):
         decision_threshold=threshold,
         model_version=metadata["model_file"]
     )
+
+
+@app.post("/predict/batch", response_model=BatchPredictionResponse)
+def predict_batch(request: BatchPredictionRequest):
+    model, metadata = load_model_and_metadata()
+    threshold = metadata["decision_threshold"]
+
+    rows = [e.model_dump(by_alias=True) for e in request.encounters]
+    df = pd.DataFrame(rows)[metadata["expected_features"]]
+
+    try:
+        probabilities = model.predict_proba(df)[:, 1]
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not score one or more encounters. Details: {e}"
+        )
+
+    predictions = [
+        PredictionResponse(
+            readmission_probability=round(float(p), 4),
+            risk_flag=bool(p >= threshold),
+            decision_threshold=threshold,
+            model_version=metadata["model_file"]
+        )
+        for p in probabilities
+    ]
+    return BatchPredictionResponse(predictions=predictions)

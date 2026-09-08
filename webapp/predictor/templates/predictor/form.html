@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hospital Readmission Risk Predictor</title>
+</head>
+<body style="font-family: sans-serif; max-width: 700px; margin: 40px auto;">
+    <h1>30-Day Readmission Risk Predictor</h1>
+    <p style="color: #666;">
+        Decision-support tool — not a diagnostic system. Predictions
+        reflect statistical association in historical data only.
+    </p>
+
+    <form method="post">
+        {% csrf_token %}
+        {{ form.as_p }}
+        <button type="submit">Predict</button>
+    </form>
+
+    {% if error %}
+        <div style="color: red; margin-top: 20px;">
+            <strong>Error:</strong> {{ error }}
+        </div>
+    {% endif %}
+
+    {% if result %}
+        <div style="margin-top: 20px; padding: 15px; border: 1px solid #ccc;">
+            <h3>Result</h3>
+            <p><strong>Readmission probability:</strong> {{ result.readmission_probability }}</p>
+            <p><strong>Flagged as high-risk:</strong> {{ result.risk_flag }}</p>
+            <p><strong>Decision threshold:</strong> {{ result.decision_threshold }}</p>
+            <p style="color: #888; font-size: 0.9em;">Model: {{ result.model_version }}</p>
+        </div>
+    {% endif %}
+</body>
+</html>

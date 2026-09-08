@@ -49,6 +49,6 @@
     "weight_documented"
   ],
   "target_column": "readmitted_30d",
-  "saved_at": "2026-09-05T17:08:35.744062",
+  "saved_at": "2026-09-08T23:25:56.913150",
   "notes": "Calibrated on a patient-grouped 50% split of the original test set (X_calib); evaluated on the disjoint other half (X_holdout). Threshold selected to minimize (8 * FN + 1 * FP) on the holdout. Known limitation: pregnancy/childbirth-related encounters (~0.7% of data) show lower recall (~43%) than the overall population (67.3%) even at this threshold \u2014 see PROJECT_DOCUMENTATION.md Section 9.3/10.3."
 }

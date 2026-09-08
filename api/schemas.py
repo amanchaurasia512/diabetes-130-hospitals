@@ -1,5 +1,5 @@
+from typing import List
 from pydantic import BaseModel, Field
-from typing import Literal
 
 
 class EncounterInput(BaseModel):
@@ -47,7 +47,7 @@ class EncounterInput(BaseModel):
     diag_3_group: str
 
     class Config:
-        populate_by_name = True   # allows the "glyburide-metformin" alias to work cleanly
+        populate_by_name = True
 
 
 class PredictionResponse(BaseModel):
@@ -55,3 +55,12 @@ class PredictionResponse(BaseModel):
     risk_flag: bool
     decision_threshold: float
     model_version: str
+
+
+class BatchPredictionRequest(BaseModel):
+    encounters: List[EncounterInput]
+
+
+class BatchPredictionResponse(BaseModel):
+    predictions: List[PredictionResponse]
+    
