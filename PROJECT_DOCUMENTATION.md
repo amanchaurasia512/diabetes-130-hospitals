@@ -1,7 +1,7 @@
 # Hospital Readmission Risk Prediction System
 ### Diabetes 130-US Hospitals (1999–2008) — Project Documentation
 
-**Status as of this document:** Modeling, error analysis, explainability, and post-hoc model improvement complete. API/Application/Power BI/final documentation layers not yet started.
+**Status as of this document:** Full pipeline (Postgres → clean → features → train → calibrate) built, verified, and promoted to production. API and Application layers serving the promoted model. Power BI and formal monitoring not yet started.
 
 ---
 
@@ -20,18 +20,27 @@ used to make individual clinical decisions.
 want to prioritize follow-up outreach (calls, appointments, medication
 review) toward the encounters most likely to bounce back within 30 days.
 
+**Data provenance:** This dataset is the same clinical extract published
+in Strack et al., "Impact of HbA1c Measurement on Hospital Readmission
+Rates: Analysis of 70,000 Clinical Database Patient Records,"
+*BioMed Research International*, 2014 (Health Facts database, Cerner
+Corporation). The paper's five inclusion criteria (inpatient, diabetic
+diagnosis, 1–14 day stay, labs performed, medications administered)
+match this project's raw row count of 101,766 exactly, confirming
+provenance.
+
 ---
 
 ## 2. Technology Stack
 
 | Layer | Tools |
 |---|---|
-| Data wrangling | Python, Pandas |
+| Data wrangling | Python, Pandas, SQLAlchemy |
 | Database | PostgreSQL |
 | Modeling | scikit-learn, XGBoost |
 | API | FastAPI |
 | Application | Django |
-| BI / Reporting | Power BI |
+| BI / Reporting | Power BI (planned) |
 | Version control | GitHub |
 
 Docker is **not** used in this project.
@@ -45,11 +54,7 @@ diabetes-130-us-hospitals-for-years-1999-2008/
 ├── .venv/
 ├── Data/
 │   ├── raw/                          # original UCI files + IDs_mapping.csv
-│   └── Processed/
-│       ├── diabetes_cleaned_data.csv     # df_clean — 101,766 rows, 67 cols
-│       ├── diabetes_modeling_data.csv    # df_model — 100,114 rows, 67 cols
-│       ├── Diabetes_orginal_file.csv     # df_model_feature — 100,114 rows, all cols incl. patient_nbr
-│       └── diabetes_model_ready.csv      # FINAL model input — 100,114 rows, 39 features + target
+│   └── Processed/                    # legacy CSV outputs from early notebook runs
 ├── Notebook/
 │   ├── 01_data_profiling.ipynb
 │   ├── 02_data_cleaning.ipynb
@@ -57,401 +62,386 @@ diabetes-130-us-hospitals-for-years-1999-2008/
 │   ├── 04_machine_learning_modeling.ipynb
 │   └── 05_model_validation_and_improvement.ipynb
 ├── Models/
-│   └── tuned_balanced_xgb_pipeline.joblib
+│   ├── tuned_balanced_xgb_pipeline.joblib          # original, notebook-trained
+│   ├── calibrated_xgb_pipeline.joblib               # original, calibrated
+│   ├── calibrated_xgb_metadata.json
+│   ├── tuned_balanced_xgb_pipeline_v2.joblib        # script-pipeline-trained
+│   ├── calibrated_xgb_pipeline_v2.joblib            # PROMOTED — served by API
+│   └── calibrated_xgb_metadata_v2.json              # PROMOTED — served by API
 ├── src/
-│   ├── __init__.py
-│   └── evaluation.py                  # evaluate_model / evaluate_thresholds / find_best_threshold
+│   ├── evaluation.py                  # evaluate_model / evaluate_thresholds / find_best_threshold
+│   ├── db/
+│   │   └── connection.py              # shared Postgres connection (SQLAlchemy)
+│   ├── data/
+│   │   ├── load_raw_data.py           # CSV -> Postgres raw_encounters
+│   │   ├── clean_data.py              # raw_encounters -> cleaned_encounters
+│   │   └── get_categorical_values.py  # pulls real category lists for Django dropdowns
+│   ├── features/
+│   │   └── build_features.py          # cleaned_encounters -> model_ready_data (39 features)
+│   └── models/
+│       ├── train.py                   # model_ready_data -> tuned_balanced_xgb_pipeline_v2
+│       ├── calibrate.py               # v2 -> calibrated_xgb_pipeline_v2 + metadata
+│       ├── generate_fixtures.py       # rebuilds pytest ground-truth fixtures for the live model
+│       └── ablation_check.py          # tests whether dominant features mask other signal
+├── api/
+│   ├── main.py, schemas.py, model_loader.py
+│   └── tests/
+│       ├── test_predict.py
+│       └── fixtures/known_cases.json  # regenerated against v2
+├── webapp/                             # Django application
+│   └── predictor/
+│       ├── forms.py                    # 26 categorical fields as real dropdowns
+│       ├── views.py                    # Post/Redirect/Get pattern (no resubmission bug)
+│       └── templates/predictor/form.html
 ├── .gitignore
+├── PROJECT_DOCUMENTATION.md
 └── requirements.txt
 ```
 
-**Which processed file is "the" model input?** `diabetes_model_ready.csv`
-is the only file that should ever be loaded to reproduce, retrain, or
-evaluate the model. The others are intermediate artifacts kept for
-traceability, not for direct modeling use. `Diabetes_orginal_file.csv`
-is needed alongside it only to recover `patient_nbr` for group-aware
-splitting, since the model-ready file intentionally excludes identifiers.
+**Data flow, end to end:**
+```
+Data/raw/diabetic_data.csv
+  → src/data/load_raw_data.py         → Postgres: raw_encounters
+  → src/data/clean_data.py            → Postgres: cleaned_encounters
+  → src/features/build_features.py    → Postgres: model_ready_data
+  → src/models/train.py               → Models/tuned_balanced_xgb_pipeline_v2.joblib
+  → src/models/calibrate.py           → Models/calibrated_xgb_pipeline_v2.joblib (LIVE)
+  → api/model_loader.py               → served via FastAPI
+  → webapp/predictor/                 → consumed via Django
+```
+Every script prints numbered checkpoints with expected values and includes
+assertions that halt execution if a stage's output doesn't match known
+ground truth — this was deliberately built in after several early
+debugging sessions where a script "ran successfully" while silently
+producing wrong output.
 
 ---
 
-## 4. Data Understanding & Cleaning (Notebooks 01–02)
+## 4. Data Understanding & Cleaning (Notebooks 01–02, reproduced in `clean_data.py`)
 
-**Raw data:** 101,766 encounters, 71,518 unique patients. Encounter-level,
-not patient-level — a patient can appear multiple times (max 40 encounters
-for one patient).
+**Raw data:** 101,766 encounters, 71,518 unique patients.
 
-**Key profiling findings (01):**
-- `?` used as a placeholder for missing values in `weight`, `payer_code`,
-  `medical_specialty`, `race`, diagnosis fields
-- `admission_type_id`, `discharge_disposition_id`, `admission_source_id`
-  are coded categoricals, not continuous numbers
-- Original 3-class target `readmitted` (`NO` / `>30` / `<30`): `<30` is
-  11,357 encounters — a minority class
-- `examide`, `citoglipton` have zero variance (single category, all rows)
-- Race and gender are consistent within a patient across repeat
-  encounters; age band can legitimately change
-
-**Key cleaning decisions (02):**
+**Key cleaning decisions**, all reproduced and verified identically in
+`src/data/clean_data.py`:
 - High-missingness columns (`weight`, `payer_code`, `max_glu_serum`,
-  `A1Cresult`) were **not dropped**. Each was converted into an
-  indicator + level pair (e.g. `weight` → `weight_documented` flag),
-  preserving the "was this measured" signal instead of discarding it.
-- Discharge dispositions were split into **two distinct categories**,
-  not one blanket "expired/hospice" exclusion:
-  - **Death-related** (`Expired`, `Expired at home/medical
-    facility/unknown` — IDs 11, 19, 20, 21): **excluded** from the
-    modeling population, because a deceased patient cannot be
-    readmitted. **1,652 encounters excluded.**
-  - **Hospice** (IDs 13, 14): **kept**. A hospice discharge can still
-    be followed by a real 30-day readmission, so excluding it would
-    have thrown away valid signal.
-- ICD-9 diagnosis codes bucketed into broad diagnosis groups
-  (`diag_1_group`, `diag_2_group`, `diag_3_group`)
-- Admin ID codes mapped to human-readable labels via `IDs_mapping.csv`
-  (`admission_type`, `discharge_disposition`, `admission_source`)
-- Medication columns summarized into aggregate features
-  (`num_medications_active`, `num_medications_up/down/steady`,
-  `medication_changed`) while raw per-drug columns were also retained
-  at this stage (later thinned in 03)
-- Binary target created: `readmitted_30d` (1 = `<30`, 0 = otherwise)
+  `A1Cresult`) converted into indicator + level pairs rather than dropped.
+  `weight` itself is deliberately left as `NaN`, never imputed or filled.
+- Discharge dispositions split: **death-related** (IDs 11, 19, 20, 21)
+  excluded (1,652 encounters); **hospice** (IDs 13, 14) deliberately kept.
+- Admin ID codes (`admission_type_id`, `discharge_disposition_id`,
+  `admission_source_id`) mapped to readable labels via `IDs_mapping.csv`.
+- ICD-9 diagnosis codes bucketed into 17 broad clinical chapters, applied
+  to all three diagnosis fields.
+- Medication columns summarized into aggregate features.
 
-**Modeling population:** `df_model` = 100,114 encounters (101,766 raw
-− 1,652 death-related). Target distribution: **88.66% negative /
-11.34% positive** — a real class imbalance that shapes every modeling
-decision downstream.
+**Modeling population:** 100,114 encounters (101,766 − 1,652
+death-related). Target distribution: **88.66% negative / 11.34%
+positive**.
 
 ---
 
-## 5. Feature Engineering (Notebook 03)
+## 5. Feature Engineering (Notebook 03, reproduced in `build_features.py`)
 
 Started from 59 provisional features (67 raw columns minus IDs, target,
-and leakage-risk columns).
+and leakage-risk columns; `death_related_disposition`, present in the
+original notebook's 67-column input but not persisted in this pipeline's
+`cleaned_encounters`, was a constant post-filter bookkeeping column with
+no effect on the final feature count).
 
-**Removed:**
-- 10 medication columns with <0.1% active prevalence (e.g.
-  `acetohexamide`, `tolbutamide`, `troglitazone`) — active in as few as
-  1–85 of 100,114 encounters
-- 6 redundant engineered columns once a cleaner indicator/level version
-  existed (e.g. dropped `max_glu_serum_level` once
-  `max_glu_serum_documented` covered the useful signal for modeling)
+**Removed:** 10 sparse medication columns (<0.1% active prevalence) + 6
+redundant engineered columns + 3 raw diagnosis codes (superseded by
+diagnosis groups) + `weight` (96.86% missing).
 
-**Final modeling dataset:** **39 features + target**, saved to
-`diabetes_model_ready.csv`. No target leakage columns present (verified
-programmatically). Patient identifier deliberately excluded from the
-feature set — but preserved separately in `Diabetes_orginal_file.csv`
-for group-aware train/test splitting.
+**Final: 39 features + target**, verified via assertion (`assert
+len(selected) == 39`) on every pipeline run.
 
 ---
 
-## 6. Machine Learning (Notebook 04)
+## 6. Machine Learning (Notebook 04, reproduced in `train.py`)
 
-**Validation strategy:** `GroupShuffleSplit` on `patient_nbr` (not a
-plain random split) — ensures the same patient never appears in both
-train and test, preventing leakage from repeat encounters of the same
-person. 80/20 split, zero patient overlap confirmed. Threshold selection
-used out-of-fold predictions only; the test set was touched exactly once,
-for final evaluation.
+**Validation strategy:** `GroupShuffleSplit` on `patient_nbr`, 80/20,
+`random_state=42`, zero patient overlap verified on every run.
 
-**Class imbalance handling:** class-weighting / balanced variants
-compared against SMOTE-based approaches during iteration.
+**Final model comparison (original, notebook-trained):**
 
-**Model comparison (test set):**
+| Model | ROC-AUC | Avg. Precision |
+|---|---:|---:|
+| Dummy (majority class) | ~0.50 | — |
+| Logistic Regression (balanced) | ~0.66 | — |
+| Random Forest (baseline) | 0.653 | 0.207 |
+| XGBoost (baseline) | 0.659 | 0.217 |
+| **XGBoost (Tuned, Balanced) — selected** | **0.668** | **0.230** |
 
-| Model | ROC-AUC | Avg. Precision (PR-AUC) | Recall @ threshold | F1 |
-|---|---:|---:|---:|---:|
-| Dummy (majority class) | ~0.50 | — | ~0 | ~0 |
-| Logistic Regression (balanced) | ~0.66 | — | 0.555 | — |
-| Random Forest (baseline) | 0.653 | 0.207 | ~0 (broken threshold) | ~0 |
-| XGBoost (baseline) | 0.659 | 0.217 | 0.430 | 0.281 |
-| **XGBoost (tuned, balanced) — SELECTED** | **0.668** | **0.230** | **0.548** | **0.281** |
+**Why not accuracy:** an always-negative classifier scores 88.66%
+accuracy while catching zero real readmissions.
 
-**Why not accuracy?** With an 88.66/11.34 class split, a model that
-always predicts "no readmission" scores 88.66% accuracy while catching
-zero real readmissions. Accuracy is not reported as a decision metric
-anywhere in this project for that reason.
+**Why recall over precision:** a missed readmission (false negative) is
+costlier in this use case than an unnecessary follow-up call (false
+positive) — formalized later via cost-ratio threshold selection.
 
-**Why prioritize recall over precision?** The two error types have
-asymmetric real-world cost in this use case:
-- **False negative** (missed readmission): a genuinely high-risk patient
-  gets no follow-up outreach — the costly, harmful miss.
-- **False positive** (unnecessary flag): a lower-risk patient gets an
-  extra phone call or check-in — mildly wasteful, not harmful.
-
-This asymmetry is why threshold selection favored recall, while
-ROC-AUC/PR-AUC guarded against the degenerate "flag everyone" solution
-that maximizes recall alone.
-
-**Final artifact:** the Tuned Balanced XGBoost pipeline (preprocessing +
-model together) was refit on the full training data and saved to
-`Models/tuned_balanced_xgb_pipeline.joblib`. Reload-verified.
-
-**Preprocessing pipeline:** `ColumnTransformer` selecting `numerical_features`
-and `categorical_features` **by name**, `remainder="drop"`. This detail
-matters — see Section 8.
+**Final hyperparameters** (`n_estimators=200, learning_rate=0.05,
+max_depth=6, min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
+scale_pos_weight` computed per-training-set): reproduced exactly in
+`src/models/train.py`.
 
 ---
 
 ## 7. Model Validation & Error Analysis (Notebook 05)
 
-**Calibration (initial):** Brier score 0.213. The calibration curve
-showed the model was **overconfident** — predicted probabilities
-exceeded observed readmission rates across most bins — while retaining
-useful **rank-ordering** ability. See Section 9 for the correction
-applied to this issue.
+**Calibration (initial):** raw model Brier score 0.2142 — overconfident.
 
-**Error rates at the original threshold (0.50):** False Positive Rate
-30.55%, False Negative Rate 45.25%.
+**FN vs. TP vs. FP vs. TN:** all four groups sit along a single apparent
+axis of "recent care intensity." `number_inpatient` increases
+monotonically across the four groups: TN (0.15) → FN (0.23) → FP (1.46)
+→ TP (1.96). Same pattern holds for ER admission, length of stay, and
+discharge to SNF/rehab.
 
-### 7.1 — False Negatives vs. True Positives
-
-Both numeric and categorical comparisons point to one consistent
-pattern: encounters the model correctly catches (true positives) look
-more medically "severe" at this specific encounter — more prior
-inpatient visits, longer stays, more medications, admission via the
-Emergency Room, discharge to a skilled nursing/rehab facility.
-Encounters the model misses (false negatives) look comparatively
-routine — shorter stays, fewer medications, planned (Physician
-Referral) admission, discharge straight home — despite still resulting
-in a real readmission.
-
-**Interpretation:** the model relies heavily on encounter-level acuity
-as a proxy for readmission risk. This works when severity and true risk
-coincide, but misses patients whose risk isn't visible in how serious
-the current encounter looked.
-
-### 7.2 — False Positives vs. True Negatives
-
-The false-positive comparison mirrors the false-negative comparison
-exactly, confirming a single underlying axis rather than two separate
-error modes. Across all four outcome groups, `number_inpatient`
-increases monotonically with predicted risk:
-
-| Group | number_inpatient (mean) | Predicted | Actual |
-|---|---:|---|---|
-| True Negative | 0.15 | Low risk | No readmission (correct) |
-| False Negative | 0.23 | Low risk | Readmitted (missed) |
-| False Positive | 1.46 | High risk | No readmission (false alarm) |
-| True Positive | 1.96 | High risk | Readmitted (correct) |
-
-The same ordering holds for prior ER admission, length of stay, and
-discharge to SNF/rehab. False positives skew toward age 80–90 and
-recent medication changes — plausibly cases where in-hospital
-management successfully resolved an acute risk that had been real at
-admission.
-
-**Conclusion:** the residual error does not stem from a feature
-engineering mistake, but from an information ceiling — factors outside
-this dataset (medication adherence, home support, follow-up access)
-likely drive much of the remaining outcome variance.
+**Conclusion:** the model relies heavily on encounter-level acuity as a
+proxy for readmission risk — genuinely predictive, but a blunt
+instrument at the margins.
 
 ---
 
 ## 8. Known Issue & Correction: Notebook 05 Data Source
 
-**Issue identified:** `05` initially loaded `diabetes_modeling_data.csv`
-(the 67-column, pre-feature-selection output of `02`) instead of
-`diabetes_model_ready.csv` (the 39-feature file `03` actually produced
-and `04` actually trained on). This left `X_test` with 64 columns
-instead of 39, including columns `03` deliberately removed (raw numeric
-ID duplicates of already-encoded string categories, 10 zero-variance
-sparse medication columns, redundant engineered columns).
-
-**Impact assessment:**
-- **Model predictions, ROC-AUC, and calibration were unaffected.** The
-  trained pipeline's `ColumnTransformer` selects columns by name with
-  `remainder="drop"`, so it silently ignored the 41 extra columns and
-  used only the 39 it was trained on.
-- **The feature-level error-analysis tables were contaminated** prior
-  to the fix, since they included columns the model never sees.
-
-**Fix applied:** `05` now loads `diabetes_model_ready.csv` for
-features/target and separately loads `Diabetes_orginal_file.csv` for
-`patient_nbr` (mirroring `04`'s approach) before rebuilding the split.
-All results in Sections 7–10 of this document reflect the corrected
-39-feature `X_test`.
+`05` initially loaded the pre-feature-selection 67-column file instead
+of the 39-feature model-ready file. Model predictions were unaffected
+(the pipeline's `ColumnTransformer` selects columns by name and
+ignores extras), but early feature-level error-analysis tables were
+contaminated until corrected.
 
 ---
 
 ## 9. Explainability (Notebook 05, Section 5)
 
-Three complementary methods were used to directly measure what the
-error analysis (Section 7) inferred indirectly.
+**Global importance**, triangulated across three methods: `number_inpatient`
+and `discharge_disposition` are the dominant drivers by every method that
+measures fairly (native gain, permutation, SHAP). `medical_specialty`
+looked scattered in native importance (60-category dilution) but is the
+3rd most important feature by permutation importance. `payer_code` is a
+real, moderate contributor, flagged as a fairness-relevant feature
+(possible proxy for socioeconomic/disability status).
 
-### 9.1 — Global Feature Importance
-
-| Feature | Native (rank) | SHAP (rank) | Permutation (rank) |
-|---|:---:|:---:|:---:|
-| `number_inpatient` | 1 | 1 | **1** |
-| `discharge_disposition` | 2 (split across dummies) | 2, 8 | **2** |
-| `medical_specialty` | scattered/misleading | — | **3** |
-| `payer_code` | 8 | 5 | 5 |
-
-`number_inpatient` and `discharge_disposition` are, by every method
-that measures fairly, the two dominant drivers of the model's
-predictions — directly confirming the Section 7 hypothesis.
-
-**Methodological note:** native (gain) importance is biased toward
-high-cardinality one-hot fields. `medical_specialty` (60 categories)
-looked scattered and unimportant in the native chart (individual rare
-dummies appearing sporadically) but is the **3rd most important
-feature overall** by permutation importance, which evaluates whole
-original features fairly. Permutation importance is the most
-trustworthy of the three for cross-feature comparison.
-
-**Fairness note:** `payer_code` (insurance type) is a real, moderate
-contributor. It should be disclosed in any deployment documentation as
-a feature that may act as a proxy for socioeconomic or disability
-status rather than a purely clinical signal.
-
-`age` and `gender` showed differences in the Section 7 group
-comparisons but do not appear in the permutation-importance top 20,
-suggesting their apparent influence is correlated with — rather than
-independent of — the two dominant utilization features.
-
-### 9.2 — Local Case Studies (four individual encounters)
-
-| Case | Predicted probability | Key finding |
-|---|---:|---|
-| Borderline False Negative | 0.4996 | Near-identical SHAP profile to the borderline FP below — a genuine toss-up, not a model failure |
-| Confident-Miss False Negative | 0.115 | Driven by pregnancy/childbirth diagnosis codes — see subgroup verification below |
-| Confident False Positive | 0.905 | `number_inpatient` alone (4.2 SD above average) contributed >60% of the total log-odds — illustrates over-reliance on one feature at extreme values |
-| Borderline False Positive | 0.5000 | Mirrors the borderline FN almost exactly (same top two features, same direction, near-identical magnitude) |
-
-**Key finding:** the borderline FN and borderline FP cases had nearly
-identical SHAP explanations (`number_inpatient` ≈ −0.25,
-"not discharged home" ≈ +0.23) and landed within 0.0001 of each other
-in log-odds — one patient returned, one didn't. Near the decision
-threshold, the model is correctly expressing genuine uncertainty, not
-making an error that could be "fixed."
+**Local case studies:** four individual encounters (borderline FN,
+confident-miss FN, confident FP, borderline FP) confirmed the global
+pattern at the individual-prediction level via SHAP waterfall
+decomposition. Borderline FN and borderline FP had nearly identical
+SHAP profiles — near-threshold predictions are genuine toss-ups, not
+model failures.
 
 ### 9.3 — Subgroup Verification: Obstetric/Pregnancy-Related Encounters
 
-The confident-miss case above prompted a direct check, since one
-anecdote should not become a documented limitation without numbers
-behind it.
+Pregnancy/childbirth-related encounters (692 of 100,114, 0.69%) have a
+genuinely lower real-world readmission rate (6.07% vs. 11.34% overall).
+Within-subgroup ranking is strong (ROC-AUC 0.743, exceeding the overall
+model's 0.668), but a fixed global threshold underperforms for this
+lower-base-rate subgroup — a **threshold-calibration limitation**, not
+evidence the model fails to understand the subgroup.
 
-**Findings:**
-- Pregnancy/childbirth-related encounters are rare (692 of 100,114,
-  0.69%) with a genuinely lower real-world readmission rate (6.07% vs.
-  11.34% overall) — the model's learned association is accurate, not
-  biased.
-- Within this subgroup (test set, n=124, 10 actual readmissions),
-  ranking ability was strong: **ROC-AUC 0.743**, exceeding the overall
-  model's 0.668. True positives were correctly scored higher (mean
-  P=0.385) than non-readmissions (mean P=0.246).
-- However, **7 of 10 subgroup readmissions fell below the 0.50
-  threshold** despite being correctly ranked as elevated risk relative
-  to peers.
+### 9.4 — External Validation Against Published Literature
 
-**Revised conclusion:** this is not evidence the model fails to
-understand obstetric-related encounters — ranking performance there is
-above average. It is evidence of a **threshold-calibration
-limitation**: a single global cutoff, tuned for an 11.34% base rate,
-cannot simultaneously suit a subgroup whose true base rate is closer to
-6–8%. Even a correctly-identified "riskier than peers" score in this
-subgroup may not clear a threshold set for the general population.
-(Note: n=10 actual positives is small; the specific miss ratio should
-be read as directional.)
+A direct SQL replication of Strack et al. (2014)'s core finding was run
+against `cleaned_encounters`:
 
----
+| A1Cresult group | This project's readmission rate | Strack et al.'s rate |
+|---|---:|---:|
+| Not tested | 11.63% | 9.4% |
+| Tested, >7% | 10.12% | — |
+| Tested, >8% | 9.95% | 8.9% |
+| Tested, Normal | 9.76% | 8.9% |
 
-## 10. Model Improvement (Notebook 05, Section 6)
+The direction matches exactly across both datasets: not being tested has
+the highest readmission rate, and every tested group sits lower. This
+independently confirms the cleaning pipeline preserved a genuine,
+previously-published clinical signal, despite this project's population
+being larger and more inclusive (100,114 vs. 69,984 — this project keeps
+every encounter and retains hospice discharges, unlike the paper's
+first-encounter-per-patient, hospice-excluded design).
 
-Two post-hoc corrections were applied to the existing trained pipeline
-— no retraining required. A calibration/holdout split (patient-grouped,
-carved from the original test set) was used so the correction was
-fitted and evaluated on disjoint data.
+**However**, `A1Cresult` does not appear in the model's top 20 features
+by permutation importance (Section 9.1). An ablation experiment
+(`src/models/ablation_check.py`) removed the two dominant features
+(`number_inpatient`, `discharge_disposition`) and retrained: `A1Cresult`
+rose only to rank 11 of 37, with importance (0.0016) roughly 6x smaller
+than the new top feature (`number_emergency`, 0.0094).
 
-### 10.1 — Recalibration
-
-Isotonic regression (via `CalibratedClassifierCV` with a frozen/prefit
-base estimator) reduced the Brier score from **0.2142 to 0.0996** —
-predicted probabilities now track observed readmission rates
-substantially more closely. Side effect: the calibrated model's
-probability range compresses somewhat at the top end, which changes
-where any given threshold should be set (see below) but does not by
-itself indicate a decision-quality problem.
-
-### 10.2 — Cost-Sensitive Threshold Selection
-
-The original threshold was selected via F1, an objective that does not
-account for the asymmetric real-world cost of a missed readmission vs.
-a false alarm. Re-selecting the threshold to explicitly minimize
-`(FN_cost × FN) + (FP_cost × FP)` revealed:
-
-- At a naive 5:1 cost ratio, both raw and calibrated probabilities
-  produced **identical total cost** (5,226) despite very different
-  recall/threshold values — confirming that comparing calibrated vs.
-  raw recall at a single, unvalidated cost ratio is misleading. The
-  right comparison is cost-at-optimal-threshold, not recall-at-arbitrary-threshold.
-- A sensitivity analysis across cost ratios (2, 3, 5, 8, 10, 15) showed
-  the original model's F1-selected threshold (54.8% recall) implicitly
-  behaves as though a missed readmission costs **roughly 7–8x** an
-  unnecessary follow-up call — an assumption that had never been stated
-  explicitly until this analysis.
-- At a ratio of 8:1, the **calibrated** probabilities outperform raw:
-  **67.3% recall** (calibrated) vs. 58.8% (raw), at comparable cost.
-
-**Recommended configuration:** isotonic-calibrated model, decision
-threshold corresponding to an assumed 8:1 FN:FP cost ratio (≈0.09 on
-calibrated probabilities). This is adjustable if a real operational
-cost estimate becomes available.
-
-### 10.3 — Residual Subgroup Limitation
-
-Re-checking the pregnancy-related subgroup (Section 9.3) at the
-improved configuration: recall improved from ~30% to **43%** (3 of 7
-caught in the final holdout), but still trails the overall population's
-67.3% recall.
-
-**Conclusion:** recalibration and cost-based threshold selection provide
-a genuine, measurable improvement (Brier score more than halved, recall
-improved from 54.8% to 67.3%) without materially harming subgroup
-performance — and improve it somewhat. However, they do not fully
-close the subgroup gap identified in Section 9.3. This is a structural
-limit of any single global threshold: subgroups with a genuinely lower
-base rate will always trail the population average to some degree.
-Fully resolving this would require subgroup-specific thresholds or a
-probability-first (no hard cutoff) deployment approach — noted as
-future work, since the pregnancy subgroup's small size (n=62–124
-across holdouts) makes a dedicated threshold statistically unreliable
-to tune with currently available data.
+**Conclusion:** the paper's finding replicates in raw association, but
+the model's own feature-importance analysis indicates this is
+substantially a **proxy relationship** — patients who receive A1C
+testing also tend to have more prior utilization and longer stays,
+signal the model already captures more directly through
+`number_inpatient`/`number_emergency`/`time_in_hospital`. Some
+independent A1C-testing signal likely remains but is not a major driver
+of this model's predictions. This is presented as a worked example of
+distinguishing genuine feature redundancy from a missed signal, per the
+project's feature-disagreement framework: (1) check for redundancy with
+existing features, (2) ablate and check if importance rises, (3) check
+for subgroup/interaction effects before concluding either the research
+or the model is "wrong."
 
 ---
 
-## 11. Roadmap
+## 10. Model Improvement (Notebook 05, Section 6 — original model)
+
+Isotonic recalibration reduced Brier score from 0.2142 to 0.0996.
+Cost-sensitive threshold selection (replacing the original F1-based
+choice) revealed the original threshold implicitly assumed a ~7–8:1
+FN:FP cost ratio; explicit selection at 8:1 improved recall from 54.8%
+to 67.3%. A residual subgroup limitation was confirmed for the
+obstetric subgroup (Section 9.3) — improved from ~30% to 43% recall,
+still trailing the population average, a structural limit of any
+single global threshold.
+
+---
+
+## 11. Data Pipeline: PostgreSQL Integration
+
+Following the original notebook-based workflow, the full pipeline was
+rebuilt as reusable, verifiable scripts reading from and writing to a
+real PostgreSQL database (`diabetes_readmission`), rather than only
+ever reading/writing CSV files. This closes the gap between the
+project's stated architecture (`Problem → Data → Database → ...`) and
+what was actually, verifiably running.
+
+**`src/db/connection.py`** — single shared SQLAlchemy engine factory.
+Passwords are URL-encoded via `urllib.parse.quote_plus` before being
+inserted into the connection string (a raw `@` in a password will
+otherwise be misparsed as the user/host separator).
+
+**`src/data/load_raw_data.py`** — loads `Data/raw/diabetic_data.csv`
+into table `raw_encounters` (101,766 rows). Safely re-runnable
+(`if_exists="replace"`).
+
+**`src/data/clean_data.py`** — `raw_encounters` → `cleaned_encounters`.
+Verified via 11 numbered checkpoints, each printing a real number
+checked against known ground truth (e.g. weight-missing count 98,569;
+gender `Not_Documented` count 3; readmitted_30d distribution
+90,409/11,357; zero nulls across all three admin-ID mapped columns;
+final shape (100114, 66)). All checkpoints matched exactly.
+
+**`src/features/build_features.py`** — `cleaned_encounters` →
+`model_ready_data` (39 features + target + `encounter_id` +
+`patient_nbr`, kept in the same table to avoid the row-order-dependent
+CSV join that caused the Notebook 05 bug in Section 8 — a direct
+architectural improvement over the original notebook pipeline).
+Verified via assertions at every stage (59 provisional features, 20
+dropped, 39 selected).
+
+**`src/models/train.py`** — `model_ready_data` → a freshly-trained
+Tuned Balanced XGBoost pipeline, using the exact hyperparameters from
+Notebook 04. Test ROC-AUC 0.6690 vs. the original notebook's 0.668 —
+confirms the script pipeline reproduces the original model, not merely
+an approximation of it.
+
+---
+
+## 12. Model v2: Calibration, Verification, and Promotion
+
+The script-trained model (`tuned_balanced_xgb_pipeline_v2.joblib`) was
+calibrated and promoted to production through the same rigor applied to
+the original model in Section 10, plus an additional verification step
+made necessary by having two candidate artifacts.
+
+**Raw comparison (both uncalibrated):**
+
+| Metric | Original | v2 |
+|---:|---:|---:|
+| ROC-AUC | 0.668 | 0.6690 |
+| Brier score | 0.2142 | 0.2133 |
+
+**Calibration (`src/models/calibrate.py`):** isotonic regression on a
+patient-grouped 50/50 split of the test set, mirroring Section 10's
+methodology exactly. Brier score: 0.2133 → 0.0994 (near-identical to
+the original's 0.2142 → 0.0996).
+
+**Threshold:** cost-sensitive search at an 8:1 FN:FP ratio found v2's
+own optimal threshold at 0.11 (vs. the original's 0.09) — expected,
+since v2 used its own fresh `GroupShuffleSplit` calls, producing a
+slightly different calibration/holdout carve.
+
+**Verification the threshold difference wasn't a regression:** recall
+at v2's own threshold (0.11) was 0.6241, noticeably below the original's
+0.6730 at threshold 0.09. Rather than accept this gap, recall was
+checked at the **same** threshold (0.09) for both models: v2 achieved
+**0.7095** — higher than the original. This confirmed the apparent
+recall gap was purely an artifact of v2's own (correctly, independently
+derived) stricter threshold, not a weaker model. v2's own threshold
+(0.11) was retained for production, since it was derived the same
+rigorous way as the original's.
+
+**Promotion:** `api/model_loader.py` updated to serve
+`calibrated_xgb_pipeline_v2.joblib` / `calibrated_xgb_metadata_v2.json`.
+`api/tests/fixtures/known_cases.json` regenerated
+(`src/models/generate_fixtures.py`) against v2's own predictions for
+the same four case types (borderline FN, confident-miss FN, confident
+FP, borderline FP) identified the same way as the original notebook's
+Section 5.5. Full pytest suite re-verified against the live, promoted
+API before this was considered complete.
+
+---
+
+## 13. API and Application Layers
+
+**FastAPI (`api/`):** `/health`, `/predict`, `/predict/batch`. Pydantic
+schema validation (`EncounterInput`) rejects malformed requests with a
+422 before they reach the model. `OneHotEncoder(handle_unknown="ignore")`
+means an unrecognized category value is silently zero-encoded rather
+than crashing the request — documented, not a bug. Model loaded once via
+`@lru_cache`, not per-request. Automated pytest suite (7 tests) checks
+the live API's predictions against `known_cases.json` ground truth on
+every run, plus schema-validation and unknown-category edge cases.
+
+**Django (`webapp/`):** thin consumer of the FastAPI service — no model
+logic duplicated. All 26 categorical form fields are real dropdowns
+(`ChoiceField`), populated from real Postgres category values via
+`src/data/get_categorical_values.py`, eliminating the possibility of a
+typo silently zero-encoding a field. Uses the Post/Redirect/Get pattern
+(`views.py`) to prevent duplicate-submission-on-refresh, a common Django
+pitfall.
+
+Both layers were verified end-to-end multiple times: after initial
+build, and again after the v2 promotion, using real rows from
+`known_cases.json` typed manually into the Django form and checked
+against the fixture's expected probability.
+
+---
+
+## 14. Roadmap
 
 | # | Step | Status |
 |---|---|---|
-| 1 | Data cleaning, feature engineering, modeling | ✅ Done |
-| 2 | Error analysis (FN/TP/FP/TN) | ✅ Done |
-| 3 | Explainability (native/permutation/SHAP, local cases, subgroup check) | ✅ Done |
-| 4 | Model improvement (recalibration, cost-sensitive threshold) | ✅ Done |
-| 5 | Fill in `04` cell 178's summary template with final numbers | ⬜ Next |
-| 6 | FastAPI service wrapping the improved pipeline (`/predict` endpoint, returning calibrated probability) | ⬜ |
-| 7 | Django application layer consuming the API | ⬜ |
-| 8 | Power BI dashboard (model performance + risk-driver views) | ⬜ |
-| 9 | Final documentation pass: README, model card, limitations | ⬜ |
+| 1 | Data cleaning, feature engineering, modeling (notebooks) | ✅ Done |
+| 2 | Error analysis, explainability, calibration (notebooks) | ✅ Done |
+| 3 | FastAPI + Django, tested end-to-end | ✅ Done |
+| 4 | PostgreSQL-backed script pipeline (raw → clean → features → train) | ✅ Done |
+| 5 | v2 model calibration, verification, and promotion to production | ✅ Done |
+| 6 | Django dropdown fields + POST-refresh fix | ✅ Done |
+| 7 | External validation against Strack et al. (2014) + ablation study | ✅ Done |
+| 8 | Power BI dashboard (performance, threshold tradeoff, error analysis, drivers, fairness) | ⬜ Next |
+| 9 | Monitoring & drift-tracking plan | ⬜ |
+| 10 | GitHub push of all pipeline/promotion work | ✅ Done |
 
 ---
 
-## 12. Limitations (for the eventual model card)
+## 15. Limitations (for the eventual model card)
 
-- ROC-AUC 0.668 (0.743 within the obstetric subgroup) is moderate
-  discrimination, consistent with published results on this dataset —
-  readmission is inherently hard to predict from claims-style data
-  alone (no clinical notes, no post-discharge information).
-- The model relies heavily on two features (`number_inpatient`,
-  `discharge_disposition`) as an acuity proxy. This drives most correct
-  predictions but also most errors in both directions (Section 7.2).
-- Even after recalibration, a single global decision threshold
-  structurally disadvantages lower-base-rate subgroups (Section 9.3,
-  10.3) — most clearly demonstrated for pregnancy/childbirth-related
-  encounters (n=692, 0.69% of the dataset).
-- `payer_code` is a moderately important predictor that may act as a
-  proxy for socioeconomic or disability status; disclose this
-  explicitly in any deployment context.
+- ROC-AUC 0.668–0.669 (0.743 within the obstetric subgroup) is moderate
+  discrimination, consistent with published results on this dataset.
+- The model relies heavily on `number_inpatient` and
+  `discharge_disposition` as an acuity proxy — drives most correct
+  predictions but also most errors in both directions.
+- A single global decision threshold structurally disadvantages
+  lower-base-rate subgroups, most clearly demonstrated for
+  pregnancy/childbirth-related encounters (0.69% of the dataset).
+- `payer_code` is a moderately important predictor that may proxy for
+  socioeconomic or disability status; disclose explicitly in any
+  deployment context.
+- `A1Cresult` (HbA1c testing status) shows a real, literature-replicated
+  association with readmission, but contributes only modestly to this
+  model's predictions once utilization features are accounted for —
+  most of its raw association is proxied through other features.
 - Dataset spans 1999–2008 US hospitals; may not generalize to current
   clinical practice, other health systems, or other countries.
 - All findings are associational. No causal claims should be drawn or
   implied from feature-importance, SHAP, or error-analysis output.
+- No production monitoring or drift-detection is currently implemented.
